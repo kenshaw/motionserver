@@ -242,7 +242,6 @@ func poll(ctxt context.Context, sl *slot, ch <-chan evdev.Event) {
 			}
 
 			sl.report.MotionTimestamp = uint64(event.Time.Nano() / int64(time.Microsecond))
-			//sl.report.MotionTimestamp = uint64(time.Now().UnixNano() / int64(time.Microsecond))
 
 			sl.Unlock()
 		}
@@ -298,7 +297,6 @@ func recv(ctxt context.Context, conn *net.UDPConn) {
 
 // process wraps processing a message.
 func process(conn *net.UDPConn, remote *net.UDPAddr, buf []byte, n int) {
-	//log.Printf(">>> read: %x", buf[:n])
 	clientID, err := processMsg(conn, remote, buf, n)
 	if err != nil {
 		log.Printf("[%s] %d ERROR: %v", remote, clientID)
@@ -391,13 +389,10 @@ func sendMsg(conn *net.UDPConn, remote *net.UDPAddr, clientID, msgType uint32, m
 	ble.PutUint32(buf[16:], msgType)
 	copy(buf[headerLen:], msg)
 
-	//log.Printf("buf: %x", buf[:headerLen+len(msg)])
-
 	// checksum
 	checksum := crc32.ChecksumIEEE(buf[:headerLen+len(msg)])
 	ble.PutUint32(buf[8:], checksum)
 
-	//log.Printf("sending: %x", buf[:headerLen+len(msg)])
 	_, err := conn.WriteToUDP(buf[:headerLen+len(msg)], remote)
 	if err != nil {
 		log.Printf("[%s] %d ERROR: could not write udp message: %v", remote, clientID, err)
