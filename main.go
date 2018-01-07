@@ -216,28 +216,33 @@ func poll(ctxt context.Context, sl *slot, ch <-chan evdev.Event) {
 			if event.Type != evdev.EventAbsolute {
 				continue
 			}
+			/*scale your floats
+			  to Gs for acclerometer and deg/sec for gyro*/
 			sl.Lock()
 			if sl.report == nil {
 				sl.report = new(Report)
 			}
 
 			switch evdev.AbsoluteType(event.Code) {
-			// gyroscope
-			case evdev.AbsoluteX:
-				sl.report.Gyro.X = float32(event.Value) / float32(axes[evdev.AbsoluteX].Res)
-			case evdev.AbsoluteY:
-				sl.report.Gyro.Y = float32(event.Value) / float32(axes[evdev.AbsoluteY].Res)
-			case evdev.AbsoluteZ:
-				sl.report.Gyro.Z = float32(event.Value) / float32(axes[evdev.AbsoluteZ].Res)
-
 			// accelerometer
+			case evdev.AbsoluteX:
+				sl.report.Accl.X = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteX].Res)
+			case evdev.AbsoluteY:
+				sl.report.Accl.Y = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteY].Res)
+			case evdev.AbsoluteZ:
+				sl.report.Accl.Z = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteZ].Res)
+
+			// gyroscope
 			case evdev.AbsoluteRX:
-				sl.report.Accl.X = float32(event.Value) / float32(axes[evdev.AbsoluteRX].Res)
+				sl.report.Gyro.X = float32(event.Value) / float32(axes[evdev.AbsoluteRX].Res)
 			case evdev.AbsoluteRY:
-				sl.report.Accl.Y = float32(event.Value) / float32(axes[evdev.AbsoluteRY].Res)
+				sl.report.Gyro.Y = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteRY].Res)
 			case evdev.AbsoluteRZ:
-				sl.report.Accl.Z = float32(event.Value) / float32(axes[evdev.AbsoluteRZ].Res)
+				sl.report.Gyro.Z = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteRZ].Res)
 			}
+
+			//sl.report.MotionTimestamp = uint64(event.Time.Nano() / int64(time.Microsecond))
+			sl.report.MotionTimestamp = uint64(time.Now().UnixNano() / int64(time.Microsecond))
 
 			sl.Unlock()
 		}
@@ -267,8 +272,7 @@ func send(ctxt context.Context, conn *net.UDPConn) {
 			reg.RUnlock()
 		}
 		remotes.RUnlock()
-
-		time.Sleep(60 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -600,17 +604,15 @@ func buildPadDataMsg(i, s int) []byte {
 	// --
 	// 12
 
-	// 8 bytes motion timestamp (low, high)
-	t := time.Now().UnixNano()
-	putFloat32(buf[48:], float32(t&0xffffffff))
-	putFloat32(buf[52:], float32((t>>32)&0xffffffff))
+	// 8 bytes motion timestamp (low, high) 48-56
+	ble.PutUint64(buf[48:], sl.report.MotionTimestamp)
 
-	// 12 byte accelerometer (x, y, z)
+	// 12 byte accelerometer (x, y, z) 56-68
 	putFloat32(buf[56:], sl.report.Accl.X)
 	putFloat32(buf[60:], sl.report.Accl.Y)
 	putFloat32(buf[64:], sl.report.Accl.Z)
 
-	// 12 byte gyroscope (p, y, r)
+	// 12 byte gyroscope (p, y, r) 68-80
 	putFloat32(buf[68:], sl.report.Gyro.X)
 	putFloat32(buf[72:], sl.report.Gyro.Y)
 	putFloat32(buf[76:], sl.report.Gyro.Z)
@@ -624,7 +626,7 @@ func buildPadDataMsg(i, s int) []byte {
 	// 12 trackpad states
 	//  8 motion timestamp
 	// 12 accelerometer
-	// 12 gyroscopeh
+	// 12 gyroscope
 	// --
 	// 80 total
 
