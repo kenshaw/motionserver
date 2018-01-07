@@ -241,8 +241,8 @@ func poll(ctxt context.Context, sl *slot, ch <-chan evdev.Event) {
 				sl.report.Gyro.Z = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteRZ].Res)
 			}
 
-			//sl.report.MotionTimestamp = uint64(event.Time.Nano() / int64(time.Microsecond))
-			sl.report.MotionTimestamp = uint64(time.Now().UnixNano() / int64(time.Microsecond))
+			sl.report.MotionTimestamp = uint64(event.Time.Nano() / int64(time.Microsecond))
+			//sl.report.MotionTimestamp = uint64(time.Now().UnixNano() / int64(time.Microsecond))
 
 			sl.Unlock()
 		}
