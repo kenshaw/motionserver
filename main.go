@@ -1,8 +1,6 @@
 // Command motionserver provides a UDP motion server for use with DualShock 4
 // controllers.
 //
-// Packet notes:
-//
 // udp packet header (ittle endian):
 // -----
 //   4 byte magic ("DSUC" or "DSUS")
@@ -13,7 +11,6 @@
 //   4 byte message type
 // -----
 //  20 total
-//
 package main
 
 import (
@@ -44,9 +41,8 @@ const (
 	dualShock4 = 2508
 
 	protocolVer = 1001
-	maxPads     = 4
+	maxSlots    = 4
 	headerLen   = 20
-	poolBufLen  = 128
 
 	msgTypeVersion   = 0x100000
 	msgTypeListPorts = 0x100001
@@ -56,16 +52,17 @@ const (
 	dsuServer = "DSUS" // DualShockUdpServer
 )
 
+// flags.
 var (
 	flagListen   = flag.String("l", "127.0.0.1:26760", "listen address")
-	flagExpiry   = flag.Duration("expiry", 1*time.Minute, "client expiry")
+	flagExpiry   = flag.Duration("expiry", 5*time.Second, "client expiry")
 	flagServerID = flag.Int("id", 0, "server id")
 )
 
 func main() {
 	flag.Parse()
 
-	// genearte server id if not specified
+	// generate server id if not specified
 	if *flagServerID == 0 {
 		b := make([]byte, 4)
 		_, err := rand.Read(b)
@@ -75,7 +72,7 @@ func main() {
 		*flagServerID = int(ble.Uint32(b))
 	}
 
-	// udp listen
+	// listen
 	addr, err := net.ResolveUDPAddr("udp", *flagListen)
 	if err != nil {
 		log.Fatal(err)
@@ -86,121 +83,212 @@ func main() {
 	}
 	defer conn.Close()
 
+	// create context
 	ctxt, cancel := context.WithCancel(context.Background())
-	go findpads(ctxt)
-	go recv(ctxt, conn)
-	go send(ctxt, conn)
 
+	// run
+	go handleExpires(ctxt)
+	go handlePads(ctxt, conn)
+	go handleMessages(ctxt, conn)
+
+	// wait for sig
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	s := <-sigs
-	log.Printf("received signal: %v", s)
+	log.Printf("received signal: %v", <-sigs)
 	cancel()
+	for _, sl := range slots.vals {
+		sl.disconnect(conn)
+	}
+	time.Sleep(1 * time.Second)
 }
 
-// findpads handles searching for connected devices.
-func findpads(ctxt context.Context) {
+// handleExpires handles removing expired client remotes.
+func handleExpires(ctxt context.Context) {
 	for {
 		select {
 		case <-ctxt.Done():
 			return
 		default:
 		}
+
 		time.Sleep(1 * time.Second)
+
+		remotes.Lock()
+		n := time.Now()
+		for _, r := range remotes.vals {
+			r.Lock()
+			if n.After(r.all) {
+				r.all = time.Time{}
+			}
+			for i, t := range r.slots {
+				if n.After(t) {
+					delete(r.slots, i)
+				}
+			}
+			for m, t := range r.macs {
+				if n.After(t) {
+					delete(r.macs, m)
+				}
+			}
+			r.Unlock()
+		}
+		remotes.Unlock()
+	}
+}
+
+// handlePads handles finding gamepads, connecting them to a slot, and starting
+// the polling for events.
+func handlePads(ctxt context.Context, conn *net.UDPConn) {
+	for {
+		select {
+		case <-ctxt.Done():
+			return
+		default:
+		}
+
+		time.Sleep(1 * time.Second)
+
+		// list available devices
 		devices, err := filepath.Glob("/dev/input/event*")
 		if err != nil {
 			continue
 		}
-		for _, n := range devices {
-			d, err := evdev.OpenFile(n)
-			if err != nil {
+
+		// iterate devices
+		for _, filename := range devices {
+			select {
+			case <-ctxt.Done():
+				return
+			default:
+			}
+
+			// open device
+			d := openDev(filename)
+			if d == nil {
 				continue
 			}
 
-			// not dualshock4 motion device
-			if id := d.ID(); id.Vendor != sonyCorp || id.Product != dualShock4 ||
-				!strings.Contains(strings.ToLower(d.Name()), "motion") {
+			// find slot
+			sl := findSlot(d)
+			if sl == nil {
 				d.Close()
 				continue
 			}
 
-			// check all expected axes are present
-			axes := d.AbsoluteTypes()
-			for _, a := range []evdev.AbsoluteType{
-				evdev.AbsoluteX, evdev.AbsoluteY, evdev.AbsoluteZ,
-				evdev.AbsoluteRX, evdev.AbsoluteRY, evdev.AbsoluteRZ,
-			} {
-				_, ok := axes[a]
-				if !ok {
-					d.Close()
-					continue
-				}
-			}
+			// start polling
+			log.Printf("[%s] %q (%s) connected to slot %d", d.serial, d.name, d.path, sl.ID)
+			ch := make(chan struct{})
+			go poll(ctxt, conn, d, ch)
 
-			// add and start polling
-			pollpad(ctxt, n, d)
+			// handle cleanup
+			go func() {
+				defer d.Close()
+				select {
+				case <-ctxt.Done():
+				case <-ch:
+				}
+
+				log.Printf("[%s] %q (%s) disconnected from slot %d", d.serial, d.name, d.path, sl.ID)
+
+				pads.Lock()
+				defer pads.Unlock()
+				delete(pads.vals, d.serial)
+
+				sl.disconnect(conn)
+			}()
 		}
 	}
 }
 
-// pollpad finds an empty slot, and starts polling the pad for events.
-func pollpad(ctxt context.Context, n string, d *evdev.Evdev) {
+// open opens a evdev device checking if it is an appropriate gamepad.
+func openDev(filename string) *dev {
+	d, err := evdev.OpenFile(filename)
+	if err != nil {
+		return nil
+	}
+
+	// not dualshock4 motion device
+	if id := d.ID(); id.Vendor != sonyCorp || id.Product != dualShock4 ||
+		!strings.Contains(strings.ToLower(d.Name()), "motion") {
+		d.Close()
+		return nil
+	}
+
+	// check all expected axes are present
+	axes := d.AbsoluteTypes()
+	for _, a := range []evdev.AbsoluteType{
+		evdev.AbsoluteX, evdev.AbsoluteY, evdev.AbsoluteZ,
+		evdev.AbsoluteRX, evdev.AbsoluteRY, evdev.AbsoluteRZ,
+	} {
+		_, ok := axes[a]
+		if !ok {
+			d.Close()
+			return nil
+		}
+	}
+
+	pads.Lock()
+	defer pads.Unlock()
+
+	// skip if pad already registered
+	serial := d.Serial()
+	if _, ok := pads.vals[serial]; ok {
+		return nil
+	}
+
+	// wrap device
+	p := &dev{d, d.Name(), serial, filename}
+	pads.vals[serial] = p
+	return p
+}
+
+// findSlot finds appropriate slot for the pad.
+func findSlot(d *dev) *Slot {
 	slots.Lock()
 	defer slots.Unlock()
 
-	var i int
-	dserial := d.Serial()
-	for ; i < maxPads; i++ {
-		if _, ok := slots.vals[i]; !ok {
+	var sl *Slot
+	var next uint8 = maxSlots
+	for i := uint8(0); i < maxSlots; i++ {
+		var ok bool
+		sl, ok = slots.vals[i]
+		if ok && sl.Serial == d.serial {
 			break
-		}
-		// already registered
-		if dserial == slots.vals[i].serial {
-			d.Close()
-			return
+		} else if next == maxSlots {
+			next = i
 		}
 	}
-	if i >= maxPads {
-		d.Close()
-		return
+
+	// no slots available
+	if sl == nil && next >= maxSlots {
+		return nil
 	}
 
-	log.Printf("[%s] connecting %q (%s)", dserial, d.Name(), n)
-	connType := ConnectionTypeNone
-	switch d.ID().BusType {
-	case evdev.BusUSB:
-		connType = ConnectionTypeUSB
-	case evdev.BusBluetooth:
-		connType = ConnectionTypeBluetooth
-	}
-	serial, err := net.ParseMAC(dserial)
-	if err != nil {
-		serial = net.HardwareAddr{00, 00, 00, 00, 00, uint8(i)}
+	if sl == nil {
+		sl = &Slot{
+			Serial: d.serial,
+			ID:     next,
+			Model:  ModelDS4,
+			MAC:    d.mac(next),
+		}
+		slots.vals[next] = sl
 	}
 
-	ctxt, cancel := context.WithCancel(ctxt)
-	sl := &slot{
-		d:      d,
-		path:   n,
-		serial: dserial,
-		pad: Pad{
-			ID:             uint8(i),
-			State:          StateConnected,
-			ConnectionType: connType,
-			Model:          ModelDS4,
-			MAC:            serial,
-			BatteryStatus:  BatteryStatusCharged,
-			Active:         true,
-		},
-		cancel: cancel,
-	}
-	slots.vals[i] = sl
-	go poll(ctxt, d, sl)
+	sl.State = StateConnected
+	sl.ConnectionType = d.connType()
+	sl.BatteryStatus = BatteryStatusCharged
+	sl.Active = true
+
+	return sl
 }
 
-// poll polls for input events from the gamepad, setting the appropriate values
-// in the report.
-func poll(ctxt context.Context, d *evdev.Evdev, sl *slot) {
+// poll polls input events from the gamepad, sending data messages to
+// registered remotes for every sync message.
+func poll(ctxt context.Context, conn *net.UDPConn, d *dev, closeCh chan struct{}) {
+	defer close(closeCh)
+
+	var count uint32
+	var report Report
 	axes, events := d.AbsoluteTypes(), d.Poll(ctxt)
 	for {
 		select {
@@ -208,72 +296,97 @@ func poll(ctxt context.Context, d *evdev.Evdev, sl *slot) {
 			return
 
 		case event := <-events:
-			axis, ok := event.Type.(evdev.AbsoluteType)
-			if !ok {
-				continue
+			// channel closed
+			if event == nil {
+				return
 			}
 
-			sl.Lock()
-			if sl.report == nil {
-				sl.report = new(Report)
-			}
-
-			// scale floats to Gs for acclerometer and deg/sec for gyro using axis' resolution
-			switch axis {
-			// accelerometer
-			case evdev.AbsoluteX:
-				sl.report.Accl.X = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteX].Res)
-			case evdev.AbsoluteY:
-				sl.report.Accl.Y = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteY].Res)
-			case evdev.AbsoluteZ:
-				sl.report.Accl.Z = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteZ].Res)
-
-			// gyroscope
-			case evdev.AbsoluteRX:
-				sl.report.Gyro.X = float32(event.Value) / float32(axes[evdev.AbsoluteRX].Res)
-			case evdev.AbsoluteRY:
-				sl.report.Gyro.Y = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteRY].Res)
-			case evdev.AbsoluteRZ:
-				sl.report.Gyro.Z = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteRZ].Res)
-			}
-
-			// motion timestamp expects reporting in microseconds
-			sl.report.MotionTimestamp = uint64(event.Time.Nano() / int64(time.Microsecond))
-
-			sl.Unlock()
-		}
-	}
-}
-
-// send handles sending outbound message events from any gamepads to registered clients.
-func send(ctxt context.Context, conn *net.UDPConn) {
-	var i int
-	for {
-		select {
-		case <-ctxt.Done():
-			return
-		default:
-		}
-		remotes.RLock()
-		for _, reg := range remotes.vals {
-			reg.RLock()
-			for slot, _ := range reg.slots {
-				msg := buildPadDataMsg(i, slot)
-				if msg == nil {
+			switch typ := event.Type.(type) {
+			// send report
+			case evdev.SyncType:
+				if evdev.SyncType(event.Code) != evdev.SyncReport {
 					continue
 				}
-				go sendMsg(conn, reg.remote, reg.clientID, msgTypePadData, msg)
-				i++
+				count++
+				go sendReport(conn, d.serial, count, report)
+
+			// record accelerometer / gyrocope in report
+			case evdev.AbsoluteType:
+				switch typ {
+				// accelerometer
+				case evdev.AbsoluteX:
+					report.Accl.X = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteX].Res)
+				case evdev.AbsoluteY:
+					report.Accl.Y = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteY].Res)
+				case evdev.AbsoluteZ:
+					report.Accl.Z = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteZ].Res)
+
+				// gyroscope
+				case evdev.AbsoluteRX:
+					report.Gyro.X = float32(event.Value) / float32(axes[evdev.AbsoluteRX].Res)
+				case evdev.AbsoluteRY:
+					report.Gyro.Y = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteRY].Res)
+				case evdev.AbsoluteRZ:
+					report.Gyro.Z = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteRZ].Res)
+				}
+
+				// motion timestamp expects reporting in microseconds
+				report.MotionTimestamp = uint64(event.Time.Nano() / int64(time.Microsecond))
 			}
-			reg.RUnlock()
 		}
-		remotes.RUnlock()
-		time.Sleep(1 * time.Millisecond)
 	}
 }
 
-// recv handles processing inbound messages.
-func recv(ctxt context.Context, conn *net.UDPConn) {
+// sendReport handles sending outbound message events from gamepads to any
+// registered clients.
+func sendReport(conn *net.UDPConn, serial string, id uint32, report Report) {
+	// find slot
+	slots.RLock()
+	var sl *Slot
+	for i := uint8(0); i < maxSlots; i++ {
+		if slots.vals[i].Serial == serial {
+			sl = slots.vals[i]
+			break
+		}
+	}
+	slots.RUnlock()
+	if sl == nil {
+		return
+	}
+
+	// collect remotes
+	var addrs []*net.UDPAddr
+	remotes.RLock()
+	for _, r := range remotes.vals {
+		if !r.all.IsZero() {
+			addrs = append(addrs, r.remote)
+			continue
+		}
+		if _, ok := r.slots[sl.ID]; ok {
+			addrs = append(addrs, r.remote)
+			continue
+		}
+		if _, ok := r.macs[serial]; ok {
+			addrs = append(addrs, r.remote)
+			continue
+		}
+	}
+	remotes.RUnlock()
+
+	// no remotes to send to, bail
+	if addrs == nil {
+		return
+	}
+
+	// build message
+	msg := buildPadDataMsg(id, sl, &report)
+	for _, remote := range addrs {
+		go sendMsg(conn, remote, msgTypePadData, msg)
+	}
+}
+
+// handleMessages handles processing inbound messages.
+func handleMessages(ctxt context.Context, conn *net.UDPConn) {
 	for {
 		var buf []byte
 		select {
@@ -285,7 +398,7 @@ func recv(ctxt context.Context, conn *net.UDPConn) {
 		}
 		n, remote, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[unknown] (unknown) ERROR: could not read from udp: %v", err)
+			log.Printf("[unknown] ERROR: could not read from udp: %v", err)
 			continue
 		}
 		go process(conn, remote, buf, n)
@@ -294,9 +407,8 @@ func recv(ctxt context.Context, conn *net.UDPConn) {
 
 // process wraps processing a message.
 func process(conn *net.UDPConn, remote *net.UDPAddr, buf []byte, n int) {
-	clientID, err := processMsg(conn, remote, buf, n)
-	if err != nil {
-		log.Printf("[%s] %d ERROR: %v", remote, clientID)
+	if err := processMsg(conn, remote, buf, n); err != nil {
+		log.Printf("[%s] ERROR: %v", remote, err)
 	}
 	select {
 	case pool <- buf:
@@ -305,234 +417,150 @@ func process(conn *net.UDPConn, remote *net.UDPAddr, buf []byte, n int) {
 }
 
 // processMsg processes an inbound message.
-func processMsg(conn *net.UDPConn, remote *net.UDPAddr, buf []byte, n int) (uint32, error) {
+func processMsg(conn *net.UDPConn, remote *net.UDPAddr, buf []byte, n int) error {
 	// validate type and message
-	r, clientID, msgType, err := validateMsg(buf, n)
+	r, _, msgType, err := validateMsg(buf, n)
 	if err != nil {
-		return clientID, fmt.Errorf("invalid message: %v", err)
-	}
-	m, ok := messageTypes[msgType]
-	if !ok {
-		return clientID, fmt.Errorf("invalid message type %d", msgType)
+		return fmt.Errorf("invalid message: %v", err)
 	}
 
-	//log.Printf("[%s] %d received %s request", remote, clientID, m.name)
+	// get message handler
+	h, ok := messageHandlers[msgType]
+	if !ok {
+		return fmt.Errorf("invalid message type %d", msgType)
+	}
 
 	// build responses
-	res, err := m.f(remote, clientID, buf[r:n])
-	if err != nil {
-		return clientID, fmt.Errorf("invalid %s message: %v", m.name, err)
+	if err := h(conn, remote, buf[r:n]); err != nil {
+		return fmt.Errorf("invalid message: %v", err)
 	}
-
-	// send responses
-	for _, msg := range res {
-		if msg == nil {
-			continue
-		}
-		//log.Printf("[%s] %d sending %s response", remote, clientID, m.name)
-		go sendMsg(conn, remote, clientID, msgType, msg)
-	}
-
-	return clientID, nil
-}
-
-// validateMsg reads and validates an incoming UDP message.
-func validateMsg(buf []byte, n int) (int, uint32, uint32, error) {
-	switch {
-	case n < headerLen:
-		return 0, 0, 0, fmt.Errorf("too short")
-	case string(buf[:4]) != dsuClient:
-		return 4, 0, 0, fmt.Errorf("invalid magic")
-	case ble.Uint16(buf[4:]) != protocolVer:
-		return 6, 0, 0, fmt.Errorf("invalid protocol version (%d)", ble.Uint16(buf[4:]))
-	}
-
-	// length
-	length := ble.Uint16(buf[6:])
-	if length < 0 || int(length)+16 != n {
-		return 8, 0, 0, fmt.Errorf("invalid length %d", length)
-	}
-
-	// checksum
-	checksum := ble.Uint32(buf[8:])
-	copy(buf[8:], empty)
-	if computed := crc32.ChecksumIEEE(buf[:n]); computed != checksum {
-		return 8, 0, 0, fmt.Errorf("invalid checksum (expected %d, received %d)", computed, checksum)
-	}
-
-	// client id + message type
-	clientID := ble.Uint32(buf[12:])
-	msgType := ble.Uint32(buf[16:])
-	return headerLen, clientID, msgType, nil
-}
-
-// sendMsg sends msg to the remote.
-func sendMsg(conn *net.UDPConn, remote *net.UDPAddr, clientID, msgType uint32, msg []byte) error {
-	var buf []byte
-	select {
-	case buf = <-pool:
-	default:
-		buf = make([]byte, poolBufLen)
-	}
-
-	// build header
-	copy(buf, dsuServerMagic)
-	ble.PutUint16(buf[4:], protocolVer)
-	z := make([]byte, 2)
-	ble.PutUint16(z, protocolVer)
-	ble.PutUint16(buf[6:], uint16(len(msg)+4))
-	copy(buf[8:], empty)
-	ble.PutUint32(buf[12:], uint32(*flagServerID))
-	ble.PutUint32(buf[16:], msgType)
-	copy(buf[headerLen:], msg)
-
-	// checksum
-	checksum := crc32.ChecksumIEEE(buf[:headerLen+len(msg)])
-	ble.PutUint32(buf[8:], checksum)
-
-	_, err := conn.WriteToUDP(buf[:headerLen+len(msg)], remote)
-	if err != nil {
-		log.Printf("[%s] %d ERROR: could not write udp message: %v", remote, clientID, err)
-	}
-
-	select {
-	case pool <- buf:
-	default:
-	}
-
 	return nil
 }
 
-// messageTypes is the map of inbound message types and their response
-// handlers.
-var messageTypes = map[uint32]struct {
-	name string
-	f    func(*net.UDPAddr, uint32, []byte) ([][]byte, error)
-}{
-	msgTypeVersion:   {"Version", versionHandler},
-	msgTypeListPorts: {"ListPorts", listPortsHandler},
-	msgTypePadData:   {"PadData", padDataHandler},
+// messageHandlers is the map of inbound message types to a handler.
+var messageHandlers = map[uint32]func(*net.UDPConn, *net.UDPAddr, []byte) error{
+	msgTypeVersion:   versionHandler,
+	msgTypeListPorts: listPortsHandler,
+	msgTypePadData:   padDataHandler,
 }
 
-var verRes = [][]byte{[]byte{}}
-
-// versionHandler creates Version responses.
-func versionHandler(*net.UDPAddr, uint32, []byte) ([][]byte, error) {
-	return verRes, nil
+// versionHandler handles incoming Version responses.
+func versionHandler(conn *net.UDPConn, remote *net.UDPAddr, req []byte) error {
+	go sendMsg(conn, remote, msgTypeVersion, []byte{})
+	return nil
 }
 
-// listPortsHandler creates the ListPorts response.
-func listPortsHandler(remote *net.UDPAddr, clientID uint32, req []byte) ([][]byte, error) {
+// listPortsHandler handles incoming ListPorts messages.
+func listPortsHandler(conn *net.UDPConn, remote *net.UDPAddr, req []byte) error {
 	// port count
 	if len(req) < 4 {
-		return nil, errors.New("request too short")
+		return errors.New("request too short")
 	}
 	count := ble.Uint32(req)
-	if count < 0 || count > maxPads {
-		return nil, errors.New("invalid count")
+	if count < 0 || count > maxSlots {
+		return errors.New("invalid count")
 	}
 	if len(req) != 4+int(count) {
-		return nil, errors.New("invalid request length")
+		return errors.New("invalid request length")
 	}
 
-	// build response
-	res := make([][]byte, count)
+	// send response for each requested slot
 	for i := 0; i < int(count); i++ {
-		// grab associated pad
-		s := int(req[4+i])
-		if s < 0 || s >= maxPads {
-			return nil, fmt.Errorf("invalid slot value in offset %d", i)
+		s := req[4+i]
+		if s < 0 || s >= maxSlots {
+			return fmt.Errorf("invalid slot value in offset %d", i)
 		}
 		slots.RLock()
 		sl, ok := slots.vals[s]
 		slots.RUnlock()
 		if !ok {
-			// this should probably be a fatal error...
 			continue
 		}
-
-		// response format
-		// 1 byte id
-		// 1 byte state
-		// 1 byte model
-		// 1 byte connection type
-		// 6 byte mac
-		// 1 byte battery status
-		// 1 byte active
-		buf := make([]byte, 12)
-		copy(buf, []byte{
-			sl.pad.ID,
-			sl.pad.State,
-			sl.pad.Model,
-			sl.pad.ConnectionType,
-		})
-		copy(buf[4:], sl.pad.MAC)
-		buf[10] = sl.pad.BatteryStatus
-		buf[11] = 1 // byte(pad.Active)
-		res[i] = buf
+		go sendMsg(conn, remote, msgTypeListPorts, buildSlotMsg(sl))
 	}
-	return res, nil
+	return nil
 }
 
-// padDataHandler creates the PadData response.
-func padDataHandler(addr *net.UDPAddr, clientID uint32, req []byte) ([][]byte, error) {
+// padDataHandler handles incoming PadData messages.
+func padDataHandler(conn *net.UDPConn, addr *net.UDPAddr, req []byte) error {
 	if len(req) != 8 {
-		return nil, errors.New("invalid request length")
+		return errors.New("invalid request length")
 	}
 
-	flags, slot, mac := req[0], int(req[1]), fmt.Sprintf("%x", net.HardwareAddr(req[2:]))
-	if slot < 0 || slot >= maxPads {
-		return nil, errors.New("invalid slot")
+	// read flags and slot information
+	flags, i, mac := req[0], req[1], fmt.Sprintf("%x", net.HardwareAddr(req[2:]))
+	if i < 0 || i >= maxSlots {
+		return errors.New("invalid slot")
 	}
 
 	remote := addr.String()
 
-	remotes.RLock()
-	unregistered := remotes.vals[remote] == nil
-	remotes.RUnlock()
+	remotes.Lock()
+	defer remotes.Unlock()
 
 	// create registration
-	if unregistered {
-		remotes.Lock()
+	if _, ok := remotes.vals[remote]; !ok {
 		remotes.vals[remote] = &reg{
-			remote:   addr,
-			clientID: clientID,
-			slots:    make(map[int]time.Time),
-			macs:     make(map[string]time.Time),
+			remote: addr,
+			slots:  make(map[uint8]time.Time),
+			macs:   make(map[string]time.Time),
 		}
-		remotes.Unlock()
 	}
 
 	remotes.vals[remote].Lock()
 	defer remotes.vals[remote].Unlock()
 
-	now := time.Now()
+	// update registration
+	t := time.Now().Add(*flagExpiry)
 	switch {
 	case flags == 0:
-		remotes.vals[remote].all = now
+		remotes.vals[remote].all = t
 	case flags&1 != 0:
-		remotes.vals[remote].slots[slot] = now
+		remotes.vals[remote].slots[i] = t
 	case flags&2 != 0:
-		remotes.vals[remote].macs[mac] = now
+		remotes.vals[remote].macs[mac] = t
 	}
-	return nil, nil
+	return nil
+}
+
+// buildSlotMsg builds a connected slot message.
+func buildSlotMsg(sl *Slot) []byte {
+	//  1 byte id
+	//  1 byte state
+	//  1 byte model
+	//  1 byte connection type
+	//  6 byte mac
+	//  1 byte battery status
+	//  1 byte active
+	// ---
+	// 12 total
+	buf := make([]byte, 12)
+	copy(buf, []byte{
+		sl.ID,
+		sl.State,
+		sl.Model,
+		sl.ConnectionType,
+	})
+	copy(buf[4:], sl.MAC)
+	buf[10] = sl.BatteryStatus
+	buf[11] = boolToByte(sl.Active)
+	return buf
 }
 
 // buildPadDataMsg builds the PadData status message
-func buildPadDataMsg(i, s int) []byte {
-	slots.RLock()
-	sl, ok := slots.vals[s]
-	slots.RUnlock()
-	if !ok {
-		return nil
-	}
-
-	sl.RLock()
-	defer sl.RUnlock()
-	if sl.report == nil {
-		return nil
-	}
-
+//
+// 12 device state
+//  4 packet counter
+//  8 button masks
+// 10 button active states
+//  2 trigger states
+// 12 trackpad states
+//  8 motion timestamp
+// 12 accelerometer
+// 12 gyroscope
+// --
+// 80 total
+func buildPadDataMsg(id uint32, sl *Slot, report *Report) []byte {
 	// -- device state (12)
 	// 1 byte id
 	// 1 byte state
@@ -543,17 +571,17 @@ func buildPadDataMsg(i, s int) []byte {
 	// 1 byte active
 	buf := make([]byte, 80)
 	copy(buf, []byte{
-		sl.pad.ID,
-		sl.pad.State,
-		sl.pad.Model,
-		sl.pad.ConnectionType,
+		sl.ID,
+		sl.State,
+		sl.Model,
+		sl.ConnectionType,
 	})
-	copy(buf[4:], sl.pad.MAC)
-	buf[10] = sl.pad.BatteryStatus
-	buf[11] = 1 //byte(pad.Active)
+	copy(buf[4:], sl.MAC)
+	buf[10] = sl.BatteryStatus
+	buf[11] = boolToByte(sl.Active)
 
 	// packet counter 4
-	ble.PutUint32(buf[12:], uint32(i))
+	ble.PutUint32(buf[12:], id)
 
 	// -- button masks
 	// 1 byte button mask (left,down,right,up,options,R3,L3,share)
@@ -596,54 +624,89 @@ func buildPadDataMsg(i, s int) []byte {
 	// --
 	// 12
 
-	// 8 bytes motion timestamp (low, high) 48-56
-	ble.PutUint64(buf[48:], sl.report.MotionTimestamp)
+	// 8 bytes motion timestamp 48-56
+	ble.PutUint64(buf[48:], report.MotionTimestamp)
 
 	// 12 byte accelerometer (x, y, z) 56-68
-	putFloat32(buf[56:], sl.report.Accl.X)
-	putFloat32(buf[60:], sl.report.Accl.Y)
-	putFloat32(buf[64:], sl.report.Accl.Z)
+	putFloat32(buf[56:], report.Accl.X)
+	putFloat32(buf[60:], report.Accl.Y)
+	putFloat32(buf[64:], report.Accl.Z)
 
 	// 12 byte gyroscope (p, y, r) 68-80
-	putFloat32(buf[68:], sl.report.Gyro.X)
-	putFloat32(buf[72:], sl.report.Gyro.Y)
-	putFloat32(buf[76:], sl.report.Gyro.Z)
-
-	// -----
-	// 12 device state
-	//  4 packet counter
-	//  8 button masks
-	// 10 button active states
-	//  2 trigger states
-	// 12 trackpad states
-	//  8 motion timestamp
-	// 12 accelerometer
-	// 12 gyroscope
-	// --
-	// 80 total
+	putFloat32(buf[68:], report.Gyro.X)
+	putFloat32(buf[72:], report.Gyro.Y)
+	putFloat32(buf[76:], report.Gyro.Z)
 
 	return buf
 }
 
-// slot holds information on a slot.
-type slot struct {
-	d      *evdev.Evdev
-	path   string
-	serial string
-	pad    Pad
-	cancel context.CancelFunc
-	report *Report
-	sync.RWMutex
+// validateMsg validates an incoming message, returning the header length,
+// client ID, and message type.
+func validateMsg(buf []byte, n int) (int, uint32, uint32, error) {
+	switch {
+	case n < headerLen:
+		return 0, 0, 0, fmt.Errorf("too short")
+	case string(buf[:4]) != dsuClient:
+		return 4, 0, 0, fmt.Errorf("invalid magic")
+	case ble.Uint16(buf[4:]) != protocolVer:
+		return 6, 0, 0, fmt.Errorf("invalid protocol version (%d)", ble.Uint16(buf[4:]))
+	}
+
+	// length
+	length := ble.Uint16(buf[6:])
+	if length < 0 || int(length)+16 != n {
+		return 8, 0, 0, fmt.Errorf("invalid length %d", length)
+	}
+
+	// checksum
+	checksum := ble.Uint32(buf[8:])
+	copy(buf[8:], empty)
+	if computed := crc32.ChecksumIEEE(buf[:n]); computed != checksum {
+		return 8, 0, 0, fmt.Errorf("invalid checksum (expected %d, received %d)", computed, checksum)
+	}
+
+	// client id + message type
+	clientID := ble.Uint32(buf[12:])
+	msgType := ble.Uint32(buf[16:])
+	return headerLen, clientID, msgType, nil
 }
 
-// reg holds the time based information for when a
-type reg struct {
-	remote   *net.UDPAddr
-	clientID uint32
-	all      time.Time
-	slots    map[int]time.Time
-	macs     map[string]time.Time
-	sync.RWMutex
+// sendMsg sends msg to the remote.
+func sendMsg(conn *net.UDPConn, remote *net.UDPAddr, msgType uint32, msg []byte) error {
+	var buf []byte
+	select {
+	case buf = <-pool:
+	default:
+		buf = make([]byte, poolBufLen)
+	}
+
+	// build header
+	copy(buf, dsuServerMagic)
+	ble.PutUint16(buf[4:], protocolVer)
+	z := make([]byte, 2)
+	ble.PutUint16(z, protocolVer)
+	ble.PutUint16(buf[6:], uint16(len(msg)+4))
+	copy(buf[8:], empty)
+	ble.PutUint32(buf[12:], uint32(*flagServerID))
+	ble.PutUint32(buf[16:], msgType)
+	copy(buf[headerLen:], msg)
+
+	// checksum
+	checksum := crc32.ChecksumIEEE(buf[:headerLen+len(msg)])
+	ble.PutUint32(buf[8:], checksum)
+
+	// send
+	_, err := conn.WriteToUDP(buf[:headerLen+len(msg)], remote)
+	if err != nil {
+		log.Printf("[%s] ERROR: could not write udp message: %v", remote, err)
+	}
+
+	select {
+	case pool <- buf:
+	default:
+	}
+
+	return nil
 }
 
 // putFloat32 is util func to assist with writing float32 to a buffer.
@@ -651,19 +714,75 @@ func putFloat32(buf []byte, f float32) {
 	ble.PutUint32(buf, math.Float32bits(f))
 }
 
+// boolToByte converts a bool to a byte.
+func boolToByte(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// dev wraps a evdev.
+type dev struct {
+	*evdev.Evdev
+	name   string
+	serial string
+	path   string
+}
+
+// connType returns the connection type for the device.
+func (d *dev) connType() ConnectionType {
+	switch d.ID().BusType {
+	case evdev.BusUSB:
+		return ConnectionTypeUSB
+	case evdev.BusBluetooth:
+		return ConnectionTypeBluetooth
+	}
+	return ConnectionTypeNone
+}
+
+// mac returns the hardware addr for the device.
+func (d *dev) mac(i uint8) net.HardwareAddr {
+	if mac, err := net.ParseMAC(d.serial); err == nil {
+		return mac
+	}
+	return net.HardwareAddr{00, 00, 00, 00, 00, i}
+}
+
+// reg holds the time based information for when a
+type reg struct {
+	remote *net.UDPAddr
+	all    time.Time
+	slots  map[uint8]time.Time
+	macs   map[string]time.Time
+	sync.RWMutex
+}
+
+const (
+	poolBufLen = 128
+)
+
 var (
 	// pool is a buffer pool.
 	pool = make(chan []byte, 20)
 
-	// slots holds connected gamepads.
-	slots = struct {
-		vals map[int]*slot
+	// pads are the connected gamepads.
+	pads = struct {
+		vals map[string]*dev
 		sync.RWMutex
 	}{
-		vals: make(map[int]*slot, maxPads),
+		vals: make(map[string]*dev),
 	}
 
-	// remotes holds the registered clients
+	// slots maps a connected gamepads.
+	slots = struct {
+		vals map[uint8]*Slot
+		sync.RWMutex
+	}{
+		vals: make(map[uint8]*Slot, maxSlots),
+	}
+
+	// remotes holds the registered clients.
 	remotes = struct {
 		vals map[string]*reg
 		sync.RWMutex
@@ -672,8 +791,11 @@ var (
 	}
 
 	// empty is an empty buffer (used to replace checksum values in messages).
-	empty          = []byte{0, 0, 0, 0}
+	empty = []byte{0, 0, 0, 0}
+
+	// dsuServerMagic is the DSUS server magic as a slice.
 	dsuServerMagic = []byte(dsuServer)
 
+	// ble is just a helper for binary.LittleEndian.
 	ble = binary.LittleEndian
 )

@@ -1,6 +1,8 @@
 package main
 
-import "net"
+import (
+	"net"
+)
 
 type State = uint8
 
@@ -40,7 +42,8 @@ const (
 	BatteryStatusCharged  BatteryStatus = 0xEF
 )
 
-type Pad struct {
+type Slot struct {
+	Serial         string
 	ID             uint8
 	State          State
 	ConnectionType ConnectionType
@@ -48,6 +51,15 @@ type Pad struct {
 	MAC            net.HardwareAddr
 	BatteryStatus  BatteryStatus
 	Active         bool
+}
+
+// disconnect clears the device state and sends one last report.
+func (sl *Slot) disconnect(conn *net.UDPConn) {
+	sl.State = StateDisconnected
+	sl.ConnectionType = ConnectionTypeNone
+	sl.BatteryStatus = BatteryStatusNone
+	sl.Active = false
+	go sendReport(conn, sl.Serial, 0, Report{})
 }
 
 type Btn int
