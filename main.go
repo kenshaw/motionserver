@@ -60,7 +60,6 @@ var (
 	flagListen   = flag.String("l", "127.0.0.1:26760", "listen address")
 	flagExpiry   = flag.Duration("expiry", 1*time.Minute, "client expiry")
 	flagServerID = flag.Int("id", 0, "server id")
-	flagDevPath  = flag.String("path", "/dev/input/event21", "device path")
 )
 
 func main() {
@@ -196,34 +195,31 @@ func pollpad(ctxt context.Context, n string, d *evdev.Evdev) {
 		cancel: cancel,
 	}
 	slots.vals[i] = sl
-	ch, err := d.Poll(ctxt, 64)
-	if err != nil {
-		return
-	}
-	go poll(ctxt, sl, ch)
+	go poll(ctxt, d, sl)
 }
 
-// poll polls for input events from the gamepad.
-func poll(ctxt context.Context, sl *slot, ch <-chan evdev.Event) {
-	axes := sl.d.AbsoluteTypes()
-	axes = axes
+// poll polls for input events from the gamepad, setting the appropriate values
+// in the report.
+func poll(ctxt context.Context, d *evdev.Evdev, sl *slot) {
+	axes, events := d.AbsoluteTypes(), d.Poll(ctxt)
 	for {
 		select {
 		case <-ctxt.Done():
 			return
 
-		case event := <-ch:
-			if event.Type != evdev.EventAbsolute {
+		case event := <-events:
+			axis, ok := event.Type.(evdev.AbsoluteType)
+			if !ok {
 				continue
 			}
-			/*scale your floats
-			  to Gs for acclerometer and deg/sec for gyro*/
+
 			sl.Lock()
 			if sl.report == nil {
 				sl.report = new(Report)
 			}
 
-			switch evdev.AbsoluteType(event.Code) {
+			// scale floats to Gs for acclerometer and deg/sec for gyro using axis' resolution
+			switch axis {
 			// accelerometer
 			case evdev.AbsoluteX:
 				sl.report.Accl.X = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteX].Res)
@@ -241,6 +237,7 @@ func poll(ctxt context.Context, sl *slot, ch <-chan evdev.Event) {
 				sl.report.Gyro.Z = -1 * float32(event.Value) / float32(axes[evdev.AbsoluteRZ].Res)
 			}
 
+			// motion timestamp expects reporting in microseconds
 			sl.report.MotionTimestamp = uint64(event.Time.Nano() / int64(time.Microsecond))
 
 			sl.Unlock()
