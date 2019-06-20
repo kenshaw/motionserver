@@ -39,6 +39,7 @@ import (
 const (
 	sonyCorp   = 1356
 	dualShock4 = 2508
+	dualShock3 = 616
 
 	protocolVer = 1001
 	maxSlots    = 4
@@ -206,24 +207,48 @@ func openDev(filename string) *dev {
 	if err != nil {
 		return nil
 	}
+	pad := -1
+	id := d.ID()
+	// check if it is either a dualshock4 or dualShock3 motion device
+	if id.Vendor == sonyCorp &&	strings.Contains(strings.ToLower(d.Name()), "motion") {
+		if id.Product == dualShock4{
+			pad = 4
+		}
+		if id.Product == dualShock3{
+			pad = 3
+		}
+	}
 
-	// not dualshock4 motion device
-	if id := d.ID(); id.Vendor != sonyCorp || id.Product != dualShock4 ||
-		!strings.Contains(strings.ToLower(d.Name()), "motion") {
+	if(pad == -1){
 		d.Close()
 		return nil
 	}
 
-	// check all expected axes are present
-	axes := d.AbsoluteTypes()
-	for _, a := range []evdev.AbsoluteType{
-		evdev.AbsoluteX, evdev.AbsoluteY, evdev.AbsoluteZ,
-		evdev.AbsoluteRX, evdev.AbsoluteRY, evdev.AbsoluteRZ,
-	} {
-		_, ok := axes[a]
-		if !ok {
-			d.Close()
-			return nil
+	// check all expected axes are present for dualShock4
+	if(pad == 4){
+		axes := d.AbsoluteTypes()
+		for _, a := range []evdev.AbsoluteType{
+			evdev.AbsoluteX, evdev.AbsoluteY, evdev.AbsoluteZ,
+			evdev.AbsoluteRX, evdev.AbsoluteRY, evdev.AbsoluteRZ,
+		} {
+			_, ok := axes[a]
+			if !ok {
+				d.Close()
+				return nil
+			}
+		}
+	}
+	// check all expected axes are present for dualShock3
+	if(pad == 3){
+		axes := d.AbsoluteTypes()
+		for _, a := range []evdev.AbsoluteType{
+			evdev.AbsoluteX, evdev.AbsoluteY, evdev.AbsoluteZ,
+		} {
+			_, ok := axes[a]
+			if !ok {
+				d.Close()
+				return nil
+			}
 		}
 	}
 
@@ -263,12 +288,16 @@ func findSlot(d *dev) *Slot {
 	if sl == nil && next >= maxSlots {
 		return nil
 	}
+	mod := ModelDS4
+	if d.ID().Product==dualShock3{
+		mod = ModelDS3
+	}
 
 	if sl == nil {
 		sl = &Slot{
 			Serial: d.serial,
 			ID:     next,
-			Model:  ModelDS4,
+			Model:  mod,
 			MAC:    d.mac(next),
 		}
 		slots.vals[next] = sl
