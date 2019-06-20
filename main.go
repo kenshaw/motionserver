@@ -210,22 +210,22 @@ func openDev(filename string) *dev {
 	pad := -1
 	id := d.ID()
 	// check if it is either a dualshock4 or dualShock3 motion device
-	if id.Vendor == sonyCorp &&	strings.Contains(strings.ToLower(d.Name()), "motion") {
-		if id.Product == dualShock4{
+	if id.Vendor == sonyCorp && strings.Contains(strings.ToLower(d.Name()), "motion") {
+		if id.Product == dualShock4 {
 			pad = 4
 		}
-		if id.Product == dualShock3{
+		if id.Product == dualShock3 {
 			pad = 3
 		}
 	}
 
-	if(pad == -1){
+	if pad == -1 {
 		d.Close()
 		return nil
 	}
 
 	// check all expected axes are present for dualShock4
-	if(pad == 4){
+	if pad == 4 {
 		axes := d.AbsoluteTypes()
 		for _, a := range []evdev.AbsoluteType{
 			evdev.AbsoluteX, evdev.AbsoluteY, evdev.AbsoluteZ,
@@ -239,7 +239,7 @@ func openDev(filename string) *dev {
 		}
 	}
 	// check all expected axes are present for dualShock3
-	if(pad == 3){
+	if pad == 3 {
 		axes := d.AbsoluteTypes()
 		for _, a := range []evdev.AbsoluteType{
 			evdev.AbsoluteX, evdev.AbsoluteY, evdev.AbsoluteZ,
@@ -289,7 +289,7 @@ func findSlot(d *dev) *Slot {
 		return nil
 	}
 	mod := ModelDS4
-	if d.ID().Product==dualShock3{
+	if d.ID().Product == dualShock3 {
 		mod = ModelDS3
 	}
 
