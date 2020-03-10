@@ -85,12 +85,12 @@ func main() {
 	defer conn.Close()
 
 	// create context
-	ctxt, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// run
-	go handleExpires(ctxt)
-	go handlePads(ctxt, conn)
-	go handleMessages(ctxt, conn)
+	go handleExpires(ctx)
+	go handlePads(ctx, conn)
+	go handleMessages(ctx, conn)
 
 	// wait for sig
 	sigs := make(chan os.Signal, 1)
@@ -104,10 +104,10 @@ func main() {
 }
 
 // handleExpires handles removing expired client remotes.
-func handleExpires(ctxt context.Context) {
+func handleExpires(ctx context.Context) {
 	for {
 		select {
-		case <-ctxt.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -139,10 +139,10 @@ func handleExpires(ctxt context.Context) {
 
 // handlePads handles finding gamepads, connecting them to a slot, and starting
 // the polling for events.
-func handlePads(ctxt context.Context, conn *net.UDPConn) {
+func handlePads(ctx context.Context, conn *net.UDPConn) {
 	for {
 		select {
-		case <-ctxt.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -158,7 +158,7 @@ func handlePads(ctxt context.Context, conn *net.UDPConn) {
 		// iterate devices
 		for _, filename := range devices {
 			select {
-			case <-ctxt.Done():
+			case <-ctx.Done():
 				return
 			default:
 			}
@@ -179,13 +179,13 @@ func handlePads(ctxt context.Context, conn *net.UDPConn) {
 			// start polling
 			log.Printf("[%s] %q (%s) connected to slot %d", d.serial, d.name, d.path, sl.ID)
 			ch := make(chan struct{})
-			go poll(ctxt, conn, d, ch)
+			go poll(ctx, conn, d, ch)
 
 			// handle cleanup
 			go func() {
 				defer d.Close()
 				select {
-				case <-ctxt.Done():
+				case <-ctx.Done():
 				case <-ch:
 				}
 
@@ -313,15 +313,15 @@ func findSlot(d *dev) *Slot {
 
 // poll polls input events from the gamepad, sending data messages to
 // registered remotes for every sync message.
-func poll(ctxt context.Context, conn *net.UDPConn, d *dev, closeCh chan struct{}) {
+func poll(ctx context.Context, conn *net.UDPConn, d *dev, closeCh chan struct{}) {
 	defer close(closeCh)
 
 	var count uint32
 	var report Report
-	axes, events := d.AbsoluteTypes(), d.Poll(ctxt)
+	axes, events := d.AbsoluteTypes(), d.Poll(ctx)
 	for {
 		select {
-		case <-ctxt.Done():
+		case <-ctx.Done():
 			return
 
 		case event := <-events:
@@ -415,11 +415,11 @@ func sendReport(conn *net.UDPConn, serial string, id uint32, report Report) {
 }
 
 // handleMessages handles processing inbound messages.
-func handleMessages(ctxt context.Context, conn *net.UDPConn) {
+func handleMessages(ctx context.Context, conn *net.UDPConn) {
 	for {
 		var buf []byte
 		select {
-		case <-ctxt.Done():
+		case <-ctx.Done():
 			return
 		case buf = <-pool:
 		default:
