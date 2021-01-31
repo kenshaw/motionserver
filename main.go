@@ -37,10 +37,10 @@ import (
 
 // magic.
 const (
-	sonyCorp   = 1356
+	sonyCorp      = 1356
 	dualShock4_v1 = 1476
 	dualShock4_v2 = 2508
-	dualShock3 = 616
+	dualShock3    = 616
 
 	protocolVer = 1001
 	maxSlots    = 4
@@ -776,7 +776,7 @@ func (d *dev) mac(i uint8) net.HardwareAddr {
 	if mac, err := net.ParseMAC(d.serial); err == nil {
 		return mac
 	}
-	return net.HardwareAddr{00, 00, 00, 00, 00, i}
+	return net.HardwareAddr{0o0, 0o0, 0o0, 0o0, 0o0, i}
 }
 
 // reg holds the time based information for when a
