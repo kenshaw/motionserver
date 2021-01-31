@@ -38,7 +38,8 @@ import (
 // magic.
 const (
 	sonyCorp   = 1356
-	dualShock4 = 2508
+	dualShock4_v1 = 1476
+	dualShock4_v2 = 2508
 	dualShock3 = 616
 
 	protocolVer = 1001
@@ -211,7 +212,7 @@ func openDev(filename string) *dev {
 	id := d.ID()
 	// check if it is either a dualshock4 or dualShock3 motion device
 	if id.Vendor == sonyCorp && strings.Contains(strings.ToLower(d.Name()), "motion") {
-		if id.Product == dualShock4 {
+		if id.Product == dualShock4_v1 || id.Product == dualShock4_v2 {
 			pad = 4
 		}
 		if id.Product == dualShock3 {
